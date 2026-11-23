@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import time
 from typing import Any, Iterable, Literal
 
 from app.config import config
@@ -28,6 +29,19 @@ GEMINI_MODEL_OPTIONS: tuple[str, ...] = (
     "gemini-3.8-flash",
     "gemini-3.1-pro-preview",
     "gemini-2.5-flash",
+)
+GEMINI_FALLBACK_MODELS: tuple[str, ...] = (
+    "gemini-3.8-flash",
+    "gemini-3.1-pro-preview",
+)
+GEMINI_RETRY_DELAY_SECONDS = 1.5
+_TRANSIENT_ERROR_MARKERS = (
+    "503",
+    "unavailable",
+    "high demand",
+    "overloaded",
+    "429",
+    "resource_exhausted",
 )
 
 MALAY_VOICES: dict[str, str] = {
@@ -349,6 +363,42 @@ def _clean_generated_script(text: str) -> str:
     return "\n\n".join(paragraphs).strip()
 
 
+def _is_transient_gemini_error(detail: str) -> bool:
+    lowered = str(detail or "").lower()
+    return any(marker in lowered for marker in _TRANSIENT_ERROR_MARKERS)
+
+
+def _format_gemini_error_bm(model_name: str, detail: str) -> str:
+    lowered = str(detail or "").lower()
+    if any(k in lowered for k in ("503", "unavailable", "high demand", "overloaded")):
+        return (
+            f"Pelayan Google Gemini ({model_name}) sedang sesak buat sementara waktu "
+            "(503 UNAVAILABLE). Sila cuba klik semula beberapa saat lagi, tukar model di panel "
+            "kiri, atau guna 'Guna Draf Templat Tempatan (Tanpa AI)'."
+        )
+    if any(k in lowered for k in ("429", "resource_exhausted")):
+        return (
+            f"Had penggunaan sementara Google Gemini ({model_name}) penuh (429). "
+            "Tunggu sebentar atau tukar model lain di panel kiri."
+        )
+    return f"Ralat Gemini ({model_name}): {detail}"
+
+
+def _run_gemini_once(prompt: str, runtime_cfg: dict[str, Any], resolved_key: str) -> tuple[str, str]:
+    """Execute one Gemini call and return `(raw_text, error_detail)` with key redacted."""
+    try:
+        raw_response = llm._generate_response(prompt=prompt, app_config=runtime_cfg)
+    except Exception as exc:
+        return "", _redact_secret(str(exc), resolved_key)
+
+    raw_text = str(raw_response or "").strip()
+    if not raw_text:
+        return "", "respons kosong"
+    if raw_text.startswith("Error:"):
+        return "", _redact_secret(raw_text.removeprefix("Error:").strip(), resolved_key)
+    return raw_text, ""
+
+
 def generate_malay_script(
     brief: CampaignBrief,
     *,
@@ -390,51 +440,54 @@ def generate_malay_script(
         custom_system_prompt=MALAY_MARKETING_SYSTEM_PROMPT,
     )
 
-    try:
-        raw_response = llm._generate_response(prompt=prompt, app_config=runtime_cfg)
-    except Exception as exc:
-        return ScriptGenerationResult(
-            ok=False,
-            script="",
-            source="error",
-            model_name=resolved_model,
-            error=f"Gagal menghubungi Gemini ({resolved_model}): {_redact_secret(str(exc), resolved_key)}",
-        )
+    attempt_models = [
+        resolved_model,
+        resolved_model,
+        *[m for m in GEMINI_FALLBACK_MODELS if m != resolved_model],
+    ]
+    last_model = resolved_model
+    last_error = ""
 
-    raw_text = str(raw_response or "").strip()
-    if not raw_text:
-        return ScriptGenerationResult(
-            ok=False,
-            script="",
-            source="error",
-            model_name=resolved_model,
-            error=f"Gemini ({resolved_model}) memulangkan respons kosong. Sila cuba jana semula.",
-        )
-    if raw_text.startswith("Error:"):
-        detail = _redact_secret(raw_text.removeprefix("Error:").strip(), resolved_key)
-        return ScriptGenerationResult(
-            ok=False,
-            script="",
-            source="error",
-            model_name=resolved_model,
-            error=f"Ralat Gemini ({resolved_model}): {detail}",
-        )
+    for idx, candidate_model in enumerate(attempt_models):
+        attempt_cfg = {**runtime_cfg, "gemini_model_name": candidate_model}
+        raw_text, error_detail = _run_gemini_once(prompt, attempt_cfg, resolved_key)
+        last_model = candidate_model
+        if error_detail:
+            last_error = error_detail
+            if _is_transient_gemini_error(error_detail) and idx < len(attempt_models) - 1:
+                time.sleep(GEMINI_RETRY_DELAY_SECONDS)
+                continue
+            return ScriptGenerationResult(
+                ok=False,
+                script="",
+                source="error",
+                model_name=last_model,
+                error=_format_gemini_error_bm(last_model, error_detail),
+            )
 
-    cleaned = _clean_generated_script(raw_text)
-    if not cleaned:
+        cleaned = _clean_generated_script(raw_text)
+        if not cleaned:
+            return ScriptGenerationResult(
+                ok=False,
+                script="",
+                source="error",
+                model_name=last_model,
+                error=f"Gemini ({last_model}) tidak memulangkan teks narasi yang sah.",
+            )
+
         return ScriptGenerationResult(
-            ok=False,
-            script="",
-            source="error",
-            model_name=resolved_model,
-            error=f"Gemini ({resolved_model}) tidak memulangkan teks narasi yang sah.",
+            ok=True,
+            script=cleaned,
+            source="gemini",
+            model_name=last_model,
         )
 
     return ScriptGenerationResult(
-        ok=True,
-        script=cleaned,
-        source="gemini",
-        model_name=resolved_model,
+        ok=False,
+        script="",
+        source="error",
+        model_name=last_model,
+        error=_format_gemini_error_bm(last_model, last_error or "tiada respons"),
     )
 
 

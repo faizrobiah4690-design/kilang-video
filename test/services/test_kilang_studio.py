@@ -192,7 +192,7 @@ class TestKilangStudio(unittest.TestCase):
         with patch(
             "app.services.kilang_studio.llm._generate_response",
             return_value="Error: 404 NOT_FOUND for key AIzaSySecretKey123",
-        ):
+        ) as mock_err:
             err_result = ks.generate_malay_script(
                 radhi,
                 api_key="AIzaSySecretKey123",
@@ -201,6 +201,54 @@ class TestKilangStudio(unittest.TestCase):
             self.assertEqual(err_result.source, "error")
             self.assertIn("404 NOT_FOUND", err_result.error)
             self.assertNotIn("AIzaSySecretKey123", err_result.error)
+            self.assertEqual(mock_err.call_count, 1)
+
+    def test_generate_malay_script_retries_and_falls_back_on_503(self):
+        radhi = ks.get_preset("radhi_fruits").to_brief()
+        seen_models = []
+
+        def fake_generate(prompt, app_config):
+            seen_models.append(app_config["gemini_model_name"])
+            if len(seen_models) < 3:
+                return "Error: 503 UNAVAILABLE. high demand"
+            return "Jom singgah Radhi Fruits hari ini, stok durian kampung segar!"
+
+        with patch("app.services.kilang_studio.time.sleep") as mock_sleep:
+            with patch(
+                "app.services.kilang_studio.llm._generate_response",
+                side_effect=fake_generate,
+            ):
+                result = ks.generate_malay_script(
+                    radhi,
+                    api_key="AIzaSySecretKey123",
+                    model_name="gemini-3.8-flash",
+                )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.source, "gemini")
+        self.assertEqual(result.model_name, "gemini-3.1-pro-preview")
+        self.assertEqual(
+            seen_models,
+            ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.1-pro-preview"],
+        )
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    def test_generate_malay_script_surfaces_friendly_503_when_all_models_busy(self):
+        radhi = ks.get_preset("radhi_fruits").to_brief()
+        with patch("app.services.kilang_studio.time.sleep"):
+            with patch(
+                "app.services.kilang_studio.llm._generate_response",
+                return_value="Error: 503 UNAVAILABLE for AIzaSySecretKey123",
+            ):
+                result = ks.generate_malay_script(
+                    radhi,
+                    api_key="AIzaSySecretKey123",
+                    model_name="gemini-3.8-flash",
+                )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.source, "error")
+        self.assertIn("503 UNAVAILABLE", result.error)
+        self.assertIn("Pelayan Google Gemini", result.error)
+        self.assertNotIn("AIzaSySecretKey123", result.error)
 
     def test_generate_visual_terms_and_missing_key(self):
         radhi = ks.get_preset("radhi_fruits").to_brief()
