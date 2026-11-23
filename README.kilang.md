@@ -1,56 +1,30 @@
-# Kilang Pemasaran — Studio Video Pendek (Adaptasi MoneyPrinterTurbo)
+# Kilang Pemasaran v2.0 — Studio Kilang Video & Hab Google Flow
 
-Studio ringkas berasaskan [MoneyPrinterTurbo](https://github.com/harry0703/MoneyPrinterTurbo) yang diadaptasi khas untuk kempen pemasaran PKS Malaysia (TikTok & Reels `9:16`):
+Adaptasi penuh [MoneyPrinterTurbo](https://github.com/harry0703/MoneyPrinterTurbo) untuk pengeluaran video pendek PKS Malaysia (TikTok, Reels & Shorts) secara tempatan dan terus *live* di Render.
 
-- **Skrip Bahasa Melayu Natural (Google Gemini)**: Penjanaan skrip gaya percakapan harian rakyat Malaysia (elak bahasa skema/Indonesia) dengan contoh sedia ada seperti **Radhi Fruits 4690**, **PedalHaus Chukai**, **Servis Van Sekolah Binjai**, dan **Kempen Produk Umum**.
-- **Suara Narasi BM Percuma (Edge TTS)**: Menyokong `ms-MY-YasminNeural` (Wanita) dan `ms-MY-OsmanNeural` (Lelaki) bersama penjanaan sarikata Edge automatik tanpa perlu memuat turun model Whisper besar.
-- **Visual Produk Sendiri, Sampel Demo, atau Video Stok**: Muat naik gambar/klip produk terus, uji serta-merta dengan 3 kad sampel `9:16` di `resource/kilang_samples/`, atau guna carian video stok Pexels/Pixabay.
+## Ciri Utama v2.0
 
-> Nota: Antaramuka asal MoneyPrinterTurbo (`webui/Main.py`) dan perkhidmatan terasnya kekal utuh tanpa diubah.
+1. **Kilang Video (1 Video Pantas & Mod Kilang Batch 3-Sudut)**:
+   - Jana 1 video pantas atau 3 variasi sudut serentak (*Urgensi & Stok Terhad*, *Kualiti, Rasa & Nilai*, *Bukti Sosial & Pelanggan*).
+   - Skrip Bahasa Melayu percakapan natural oleh **Google Gemini** (`gemini-3.8-flash` dengan carian automatik model pelan percuma `Flash-Lite` apabila sesak `503`/`429`) + pek **Kapsyen & Hashtag TikTok/Reels**.
+   - Suara narasi BM percuma **Edge TTS** (`ms-MY-YasminNeural` & `ms-MY-OsmanNeural`), pilihan warna sarikata, nisbah (`9:16`, `1:1`, `16:9`), dan muzik latar terbina atau muat naik MP3 sendiri.
+2. **Pelayar Studio In-House & Pintu Masuk Google Flow** (`app/services/studio_browser.py`):
+   - **Mod Komputer Tempatan (Desktop)**: Melancarkan tetingkap Chromium/Edge terasing (`storage/studio_browser_profile/`) untuk log masuk Google Flow, Whisk, Google AI Studio, Pixabay, Canva, atau TikTok Studio — semua muat turun masuk terus ke `storage/flow_inbox/`.
+   - **Mod Pelayan Awan (Render Live)**: Pautan studio terus, kotak muat naik seret-dan-lepas ke `storage/flow_inbox/`, **Penjana Prompt Adegan Google Flow (`9:16` Veo / Nano Banana)**, serta integrasi terus **UseAPI Google Flow** (`USEAPI_TOKEN`).
+3. **Peti Jenama & Galeri Hasil** (`app/services/kilang_vault.py`):
+   - Simpan profil klien berulang (`storage/kilang_brands.json`) dan semak/mainkan/muat turun/padam semua MP4 siap bersama kapsyen (`storage/kilang_history.json`).
+4. **Sambungan & Kesihatan**:
+   - Ujian langsung Gemini + pengesanan model pelan percuma, FFmpeg, Edge TTS, enjin pelayar in-house, Pixabay/Pexels, dan UseAPI.
 
----
-
-## 1. Menjalankan Secara Tempatan (Local)
-
-### Prasyarat
-- **Python 3.11+** & [`uv`](https://docs.astral.sh/uv/)
-- **FFmpeg** tersedia pada `PATH`
-
-### Langkah Pantas
-1. Salin `.env.example` kepada `.env` dan isi `GEMINI_API_KEY` (atau masukkan terus di panel tepi UI sebagai kunci sesi):
-   ```bash
-   cp .env.example .env
-   ```
-2. Pasang kebergantungan (jika belum):
-   ```bash
-   uv sync --frozen
-   ```
-3. Lancarkan studio ringkas:
-   - **Windows**: Klik dua kali `kilang.bat` atau jalankan `.\kilang.bat`
-   - **Linux / macOS**:
-     ```bash
-     chmod +x kilang.sh && ./kilang.sh
-     ```
-   - **Atau melalui `uv`**:
-     ```bash
-     uv run streamlit run webui/KilangStudio.py
-     ```
-4. Buka pelayar di `http://127.0.0.1:8501`.
+> Fail teras asal MoneyPrinterTurbo (`webui/Main.py`, `app/services/llm.py`, `task.py`, `video.py`, `voice.py`) dikekalkan utuh.
 
 ---
 
-## 2. Terus Deploy Live (Cloud)
+## 1. Jalankan Secara Tempatan
+- **Windows**: Klik dua kali [kilang.bat](file:///d:/CHROME/Project/PPX%20MarTech/kilang-video/kilang.bat) (`http://127.0.0.1:8501`).
+- **Linux / macOS**: `chmod +x kilang.sh && ./kilang.sh`
+- Tetapkan `GEMINI_API_KEY` (dan pilihan `PIXABAY_API_KEY` / `USEAPI_TOKEN`) dalam `.env` atau terus pada panel kiri WebUI.
 
-### Pilihan A — Render (Blueprint `render.kilang.yaml`)
-1. Tolak folder `kilang-video` ke repositori GitHub anda (pastikan `.env` dan `config.toml` tidak di-commit).
-2. Dalam [Render Dashboard](https://dashboard.render.com/), pilih **New + -> Blueprint** dan pilih repositori tersebut (atau rujuk `render.kilang.yaml`).
-3. Masukkan nilai `GEMINI_API_KEY` (dan `PEXELS_API_KEY` jika guna mod stok) di Environment Variables.
-4. Render akan membina imej dari `Dockerfile.kilang` dan memantau `/_stcore/health`.
-
-### Pilihan B — Docker / Railway / Fly.io / Hugging Face Spaces
-Bina dan jalankan terus daripada `Dockerfile.kilang` (menyokong pembolehubah `PORT`, contohnya `PORT=7860` untuk Hugging Face Spaces Docker SDK):
-
-```bash
-docker build -f Dockerfile.kilang -t kilang-pemasaran .
-docker run -p 8501:8501 -e GEMINI_API_KEY="AIza..." kilang-pemasaran
-```
+## 2. Live Online (Render Blueprint)
+- Dikonfigurasi siap dengan `render.yaml` (pelan `free`, `autoDeploy: true`, `Dockerfile.kilang`, `/_stcore/health`).
+- Tetapkan `GEMINI_API_KEY` (wajib untuk AI), `PIXABAY_API_KEY` (pilihan video stok), dan `USEAPI_TOKEN` (pilihan Google Flow API terus) di bahagian **Environment** Render.

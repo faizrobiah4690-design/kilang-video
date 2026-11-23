@@ -15,3 +15,5 @@ services:
         sync: false
       - key: PIXABAY_API_KEY
         sync: false
+      - key: USEAPI_TOKEN
+        sync: false

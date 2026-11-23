@@ -23,11 +23,13 @@ if not defined PY_CMD (
     )
 )
 
+set "THEME_FLAGS=--theme.base=dark --theme.primaryColor=#10B981 --theme.backgroundColor=#0B1120 --theme.secondaryBackgroundColor=#111C33 --theme.textColor=#F1F5F9"
+
 if not defined PY_CMD (
     where uv >nul 2>nul
     if not errorlevel 1 (
         echo ***** Memulakan Kilang Pemasaran melalui uv... *****
-        uv run streamlit run webui\KilangStudio.py --server.address=%HOST% --server.port=%PORT% --browser.gatherUsageStats=false
+        uv run streamlit run webui\KilangStudio.py --server.address=%HOST% --server.port=%PORT% --browser.gatherUsageStats=false %THEME_FLAGS%
         exit /b %errorlevel%
     )
 )
@@ -47,4 +49,4 @@ if not defined PY_CMD (
 )
 
 echo ***** Kilang Pemasaran WebUI: http://%HOST%:%PORT% *****
-"%PY_CMD%" -m streamlit run webui\KilangStudio.py --server.address=%HOST% --server.port=%PORT% --browser.gatherUsageStats=false
+"%PY_CMD%" -m streamlit run webui\KilangStudio.py --server.address=%HOST% --server.port=%PORT% --browser.gatherUsageStats=false %THEME_FLAGS%

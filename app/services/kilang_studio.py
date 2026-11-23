@@ -128,7 +128,49 @@ _STOCK_ENV_MAP = (
     ("pexels_api_keys", "PEXELS_API_KEY"),
     ("pixabay_api_keys", "PIXABAY_API_KEY"),
 )
-_SUPPORTED_VIDEO_SOURCES = frozenset({"local", "pexels", "pixabay"})
+_SUPPORTED_VIDEO_SOURCES = frozenset({"local", "pexels", "pixabay", "useapi", "useapi_image"})
+
+BATCH_ANGLES: dict[str, dict[str, str]] = {
+    "urgensi": {
+        "label": "Urgensi & Stok Terhad",
+        "guidance": (
+            "Fokus kepada stok atau slot harian yang terhad, jangan lepaskan peluang hari ini, "
+            "dan seruan tindakan segera ke WhatsApp atau pickup terus."
+        ),
+    },
+    "kualiti": {
+        "label": "Kualiti, Rasa & Nilai",
+        "guidance": (
+            "Fokus kepada kualiti bahan, kesegaran/keaslian, hasil sebenar, dan nilai berbaloi "
+            "berbanding harga."
+        ),
+    },
+    "bukti_sosial": {
+        "label": "Bukti Sosial & Pelanggan",
+        "guidance": (
+            "Fokus kepada kepercayaan pelanggan tempatan yang selalu repeat order, sesuai dikongsi "
+            "bersama keluarga atau kawan sekerja."
+        ),
+    },
+}
+
+SUBTITLE_COLOR_PRESETS: dict[str, str] = {
+    "#FFFFFF": "Putih Klasik",
+    "#FDE047": "Kuning Viral TikTok",
+    "#86EFAC": "Hijau Segar",
+    "#38BDF8": "Biru Cerah",
+}
+
+ASPECT_OPTIONS: dict[str, str] = {
+    "9:16": "9:16 Menegak (TikTok / Reels / Shorts)",
+    "1:1": "1:1 Segi Empat (Feed IG / FB)",
+    "16:9": "16:9 Melintang (YouTube)",
+}
+
+USEAPI_GOOGLE_FLOW_MODELS: dict[str, tuple[str, ...]] = {
+    "video": ("veo-3.1-lite", "omni-flash-1.2"),
+    "image": ("nano-banana-2-lite", "nano-banana-2"),
+}
 
 
 @dataclass(frozen=True)
@@ -240,6 +282,39 @@ class ScriptGenerationResult:
 
     ok: bool
     script: str
+    source: Literal["gemini", "offline_template", "error"]
+    model_name: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class BatchAngleDraft:
+    """One angle draft inside Batch 3-Sudut video factory mode."""
+
+    angle_key: str
+    angle_label: str
+    result: ScriptGenerationResult
+
+
+@dataclass(frozen=True)
+class FlowPromptResult:
+    """Scene-by-scene visual prompts formatted for Google Flow Veo / Nano Banana."""
+
+    ok: bool
+    prompts: tuple[str, ...]
+    source: Literal["gemini", "offline_template", "error"]
+    model_name: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class SocialPackResult:
+    """Malay TikTok/Reels title, caption, and hashtags accompanying a rendered video."""
+
+    ok: bool
+    title: str
+    caption: str
+    hashtags: tuple[str, ...]
     source: Literal["gemini", "offline_template", "error"]
     model_name: str = ""
     error: str = ""
@@ -507,11 +582,56 @@ def _finalize_gemini_result(model_name: str, raw_text: str) -> ScriptGenerationR
     )
 
 
+def _execute_gemini_with_fallback(
+    prompt: str,
+    runtime_cfg: dict[str, Any],
+    resolved_key: str,
+    resolved_model: str,
+) -> tuple[bool, str, str, str]:
+    """Run one Gemini request with overload retry & Free-Tier Flash-Lite fallback."""
+    raw_text, error_detail = _run_gemini_once(prompt, runtime_cfg, resolved_key)
+    if not error_detail:
+        return True, raw_text, resolved_model, ""
+
+    if _is_auth_or_request_error(error_detail):
+        return False, "", resolved_model, _format_gemini_error_bm(resolved_model, error_detail)
+
+    attempt_queue: list[str] = []
+    if _is_overload_error(error_detail):
+        attempt_queue.append(resolved_model)
+    elif not _is_quota_or_missing_model_error(error_detail):
+        return False, "", resolved_model, _format_gemini_error_bm(resolved_model, error_detail)
+
+    attempt_queue.extend(
+        _build_free_tier_fallbacks(
+            resolved_model,
+            resolved_key,
+            runtime_cfg.get("gemini_base_url", ""),
+        )
+    )
+
+    last_model = resolved_model
+    last_error = error_detail
+    for candidate_model in attempt_queue:
+        time.sleep(GEMINI_RETRY_DELAY_SECONDS)
+        attempt_cfg = {**runtime_cfg, "gemini_model_name": candidate_model}
+        cand_text, cand_err = _run_gemini_once(prompt, attempt_cfg, resolved_key)
+        last_model = candidate_model
+        if not cand_err:
+            return True, cand_text, candidate_model, ""
+        last_error = cand_err
+        if _is_auth_or_request_error(cand_err):
+            break
+
+    return False, "", last_model, _format_gemini_error_bm(last_model, last_error)
+
+
 def generate_malay_script(
     brief: CampaignBrief,
     *,
     api_key: str = "",
     model_name: str = "",
+    angle_key: str = "",
 ) -> ScriptGenerationResult:
     """Generate a natural Malaysian Bahasa Melayu marketing script via Google Gemini."""
     product_name = brief.product_name.strip()
@@ -540,6 +660,10 @@ def generate_malay_script(
 
     profile = _duration_profile(brief.duration_seconds)
     requirements = build_malay_brief_requirements(brief)
+    if angle_key in BATCH_ANGLES:
+        angle = BATCH_ANGLES[angle_key]
+        requirements += f"\n- Sudut Kempen Khusus: {angle['label']} ({angle['guidance']})"
+
     prompt = llm.build_script_prompt(
         video_subject=product_name,
         language="Bahasa Melayu (Malaysia)",
@@ -548,59 +672,351 @@ def generate_malay_script(
         custom_system_prompt=MALAY_MARKETING_SYSTEM_PROMPT,
     )
 
-    raw_text, error_detail = _run_gemini_once(prompt, runtime_cfg, resolved_key)
-    if not error_detail:
-        return _finalize_gemini_result(resolved_model, raw_text)
-
-    if _is_auth_or_request_error(error_detail):
+    ok, raw_text, used_model, error_bm = _execute_gemini_with_fallback(
+        prompt, runtime_cfg, resolved_key, resolved_model
+    )
+    if not ok:
         return ScriptGenerationResult(
             ok=False,
             script="",
             source="error",
-            model_name=resolved_model,
-            error=_format_gemini_error_bm(resolved_model, error_detail),
+            model_name=used_model,
+            error=error_bm,
         )
+    return _finalize_gemini_result(used_model, raw_text)
 
-    attempt_queue: list[str] = []
-    if _is_overload_error(error_detail):
-        attempt_queue.append(resolved_model)
-    elif not _is_quota_or_missing_model_error(error_detail):
-        return ScriptGenerationResult(
+
+def generate_batch_malay_scripts(
+    brief: CampaignBrief,
+    *,
+    angles: tuple[str, ...] = ("urgensi", "kualiti", "bukti_sosial"),
+    api_key: str = "",
+    model_name: str = "",
+) -> list[BatchAngleDraft]:
+    """Generate distinct Bahasa Melayu script variants across multiple marketing angles."""
+    drafts: list[BatchAngleDraft] = []
+    for angle_key in angles:
+        angle = BATCH_ANGLES.get(angle_key, {"label": angle_key})
+        res = generate_malay_script(
+            brief,
+            api_key=api_key,
+            model_name=model_name,
+            angle_key=angle_key,
+        )
+        drafts.append(
+            BatchAngleDraft(
+                angle_key=angle_key,
+                angle_label=angle["label"],
+                result=res,
+            )
+        )
+    return drafts
+
+
+def build_batch_offline_templates(
+    brief: CampaignBrief,
+    *,
+    angles: tuple[str, ...] = ("urgensi", "kualiti", "bukti_sosial"),
+) -> list[BatchAngleDraft]:
+    """Generate explicit non-AI 3-angle Bahasa Melayu starter drafts."""
+    product = brief.product_name.strip() or "produk pilihan anda"
+    offer = brief.offer.strip() or "tawaran khas minggu ini"
+    usp = brief.usp.strip() or "kualiti terjaga dan memang berbaloi"
+    cta = brief.audience_cta.strip() or "WhatsApp kami sekarang"
+
+    angle_scripts = {
+        "urgensi": (
+            f"Jangan tunggu sampai habis! Hari ini di {product}, ada {offer}. "
+            f"{usp}. Stok harian memang cepat susut, jadi {cta} sekarang juga!"
+        ),
+        "kualiti": (
+            f"Nak tahu kenapa ramai pilih {product}? Sebab {usp}. "
+            f"Ditambah pula dengan {offer}, memang berbaloi untuk anda cuba. {cta} hari ini!"
+        ),
+        "bukti_sosial": (
+            f"Ramai pelanggan sekitar dah repeat order {product}! Mereka suka sebab {usp} "
+            f"dan sekarang ada {offer}. Jom cuba sendiri — {cta}!"
+        ),
+    }
+
+    drafts: list[BatchAngleDraft] = []
+    for angle_key in angles:
+        angle = BATCH_ANGLES.get(angle_key, {"label": angle_key})
+        script = angle_scripts.get(angle_key) or build_offline_template_script(brief).script
+        drafts.append(
+            BatchAngleDraft(
+                angle_key=angle_key,
+                angle_label=angle["label"],
+                result=ScriptGenerationResult(
+                    ok=True,
+                    script=script,
+                    source="offline_template",
+                    model_name="offline_template",
+                ),
+            )
+        )
+    return drafts
+
+
+def generate_google_flow_prompts(
+    brief: CampaignBrief,
+    script: str,
+    *,
+    scene_count: int = 4,
+    api_key: str = "",
+    model_name: str = "",
+) -> FlowPromptResult:
+    """Generate scene-by-scene 9:16 Google Flow (Veo / Nano Banana) prompts via Gemini."""
+    count = max(2, min(int(scene_count), 6))
+    runtime_cfg = resolve_gemini_runtime_config(api_key=api_key, model_name=model_name)
+    resolved_key = runtime_cfg["gemini_api_key"]
+    resolved_model = runtime_cfg["gemini_model_name"]
+    if not resolved_key:
+        return FlowPromptResult(
             ok=False,
-            script="",
+            prompts=(),
             source="error",
             model_name=resolved_model,
-            error=_format_gemini_error_bm(resolved_model, error_detail),
+            error="Kunci API Gemini diperlukan untuk menjana prompt Google Flow secara automatik.",
         )
 
-    attempt_queue.extend(
-        _build_free_tier_fallbacks(
-            resolved_model,
-            resolved_key,
-            runtime_cfg.get("gemini_base_url", ""),
+    prompt = (
+        f"Create {count} vivid, photorealistic vertical 9:16 short-video scene prompts in English "
+        f"for Google Flow (Veo / Nano Banana) promoting '{brief.product_name.strip() or 'Malaysian product'}'. "
+        f"Offer context: {brief.offer}. Visual USP: {brief.usp}. "
+        f"Voiceover narration context: {(script or brief.offer).strip()}\n"
+        f"Return ONLY a JSON array of {count} strings. Every prompt must include lighting, camera movement, "
+        f"Malaysian authentic setting, and 'Vertical 9:16'. No text overlays inside the video."
+    )
+    ok, raw_text, used_model, error_bm = _execute_gemini_with_fallback(
+        prompt, runtime_cfg, resolved_key, resolved_model
+    )
+    if not ok:
+        return FlowPromptResult(
+            ok=False,
+            prompts=(),
+            source="error",
+            model_name=used_model,
+            error=error_bm,
         )
+
+    cleaned = llm._strip_code_fence(raw_text)
+    parsed = llm._extract_embedded_json(cleaned, "[")
+    if isinstance(parsed, list):
+        prompts = tuple(str(item).strip() for item in parsed if str(item).strip())[:count]
+    else:
+        lines = [
+            re.sub(r"^\d+[\).\-\s]+", "", line).strip()
+            for line in cleaned.splitlines()
+            if line.strip()
+        ]
+        prompts = tuple(lines[:count])
+
+    if not prompts:
+        return FlowPromptResult(
+            ok=False,
+            prompts=(),
+            source="error",
+            model_name=used_model,
+            error="Gemini tidak memulangkan senarai prompt adegan Google Flow yang sah.",
+        )
+    return FlowPromptResult(
+        ok=True,
+        prompts=prompts,
+        source="gemini",
+        model_name=used_model,
     )
 
-    last_model = resolved_model
-    last_error = error_detail
-    for candidate_model in attempt_queue:
-        time.sleep(GEMINI_RETRY_DELAY_SECONDS)
-        attempt_cfg = {**runtime_cfg, "gemini_model_name": candidate_model}
-        cand_text, cand_err = _run_gemini_once(prompt, attempt_cfg, resolved_key)
-        last_model = candidate_model
-        if not cand_err:
-            return _finalize_gemini_result(candidate_model, cand_text)
-        last_error = cand_err
-        if _is_auth_or_request_error(cand_err):
-            break
 
-    return ScriptGenerationResult(
-        ok=False,
-        script="",
-        source="error",
-        model_name=last_model,
-        error=_format_gemini_error_bm(last_model, last_error),
+def build_offline_flow_prompts(
+    brief: CampaignBrief,
+    *,
+    scene_count: int = 4,
+) -> FlowPromptResult:
+    """Build deterministic vertical 9:16 Google Flow starter prompts (non-AI fallback)."""
+    product = brief.product_name.strip() or "Malaysian local product"
+    offer = brief.offer.strip() or "daily fresh showcase"
+    templates = (
+        f"Vertical 9:16 cinematic close-up hero shot of {product}, warm natural morning sunlight, crisp macro textures, slow push-in camera motion, Malaysian market stall aesthetic, no text overlays.",
+        f"Vertical 9:16 medium shot highlighting {offer}, authentic Malaysian shop counter in background, shallow depth of field, vibrant natural colors, smooth handheld gimbal pan, no text.",
+        f"Vertical 9:16 detail shot of hands preparing or inspecting {product} carefully, appetizing realistic lighting, clean commercial framing, smooth slow-motion 60fps feel, no text.",
+        f"Vertical 9:16 happy Malaysian customer receiving {product} cleanly packed at counter, warm welcoming smile, golden-hour lighting, steady medium-close shot, no text.",
+        f"Vertical 9:16 top-down product flatlay of {product} arranged neatly on natural wood table, crisp studio daylight, slow orbit camera move, no text.",
+        "Vertical 9:16 wide inviting storefront shot in Malaysia showing fresh stock ready for pickup, lively friendly atmosphere, smooth dolly-in, no text.",
     )
+    count = max(2, min(int(scene_count), len(templates)))
+    return FlowPromptResult(
+        ok=True,
+        prompts=templates[:count],
+        source="offline_template",
+        model_name="offline_template",
+    )
+
+
+def generate_social_pack(
+    brief: CampaignBrief,
+    script: str,
+    *,
+    platform: str = "tiktok",
+    api_key: str = "",
+    model_name: str = "",
+) -> SocialPackResult:
+    """Generate Malaysian Bahasa Melayu social title, caption, and hashtags via Gemini."""
+    runtime_cfg = resolve_gemini_runtime_config(api_key=api_key, model_name=model_name)
+    resolved_key = runtime_cfg["gemini_api_key"]
+    resolved_model = runtime_cfg["gemini_model_name"]
+    if not resolved_key:
+        return SocialPackResult(
+            ok=False,
+            title="",
+            caption="",
+            hashtags=(),
+            source="error",
+            model_name=resolved_model,
+            error="Kunci API Gemini diperlukan untuk menjana kapsyen & hashtag secara automatik.",
+        )
+
+    prompt = (
+        f"Write a natural Malaysian Bahasa Melayu {platform} post metadata JSON for '{brief.product_name.strip()}'.\n"
+        f"Offer: {brief.offer}\nCTA: {brief.audience_cta}\nVideo script: {script.strip()}\n"
+        'Return ONLY valid JSON: {"title": "<max 60 chars hook>", "caption": "<natural 2-line BM caption with CTA>", '
+        '"hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"]}. Avoid Indonesian words.'
+    )
+    ok, raw_text, used_model, error_bm = _execute_gemini_with_fallback(
+        prompt, runtime_cfg, resolved_key, resolved_model
+    )
+    if not ok:
+        return SocialPackResult(
+            ok=False,
+            title="",
+            caption="",
+            hashtags=(),
+            source="error",
+            model_name=used_model,
+            error=error_bm,
+        )
+
+    cleaned = llm._strip_code_fence(raw_text)
+    parsed = llm._extract_embedded_json(cleaned, "{")
+    if not isinstance(parsed, dict):
+        return SocialPackResult(
+            ok=False,
+            title="",
+            caption="",
+            hashtags=(),
+            source="error",
+            model_name=used_model,
+            error="Format kapsyen Gemini tidak sah. Sila cuba lagi atau guna templat kapsyen.",
+        )
+    raw_tags = parsed.get("hashtags") or []
+    tags = tuple(
+        tag if str(tag).startswith("#") else f"#{tag}"
+        for tag in (str(t).strip() for t in raw_tags)
+        if tag and tag != "#"
+    )[:6]
+    return SocialPackResult(
+        ok=True,
+        title=str(parsed.get("title", "")).strip() or brief.product_name.strip(),
+        caption=str(parsed.get("caption", "")).strip() or brief.audience_cta.strip(),
+        hashtags=tags or ("#fypmalaysia", "#tiktokmalaysia"),
+        source="gemini",
+        model_name=used_model,
+    )
+
+
+def build_offline_social_pack(
+    brief: CampaignBrief,
+    *,
+    platform: str = "tiktok",
+) -> SocialPackResult:
+    """Create an explicit non-AI Malaysian BM social caption and hashtag starter pack."""
+    product = brief.product_name.strip() or "Bisnes Tempatan"
+    offer = brief.offer.strip() or "Tawaran segar harian"
+    cta = brief.audience_cta.strip() or "WhatsApp kami sekarang"
+    slug = re.sub(r"[^a-z0-9]", "", product.lower()) or "produkmalaysia"
+    hashtags = (
+        f"#{slug}",
+        "#fypmalaysia",
+        "#bisneslokal",
+        "#kemaman" if "kemaman" in (offer + cta).lower() else "#supportlokal",
+        "#tiktokmalaysia" if platform == "tiktok" else "#reelsmalaysia",
+    )
+    return SocialPackResult(
+        ok=True,
+        title=f"{product} — {offer[:40]}".strip(),
+        caption=f"{offer}. {cta}!",
+        hashtags=hashtags,
+        source="offline_template",
+        model_name="offline_template",
+    )
+
+
+def resolve_useapi_config(
+    token: str = "",
+    video_model: str = "",
+    image_model: str = "",
+) -> dict[str, str]:
+    """Resolve UseAPI Google Flow token and default video/image models."""
+    load_dotenv_if_present()
+    resolved_token = (
+        token.strip()
+        or os.getenv("USEAPI_TOKEN", "").strip()
+        or str(config.app.get("useapi_api_token", "") or "").strip()
+    )
+    resolved_vmodel = (
+        video_model.strip()
+        or str(config.app.get("useapi_video_model", "") or "").strip()
+        or USEAPI_GOOGLE_FLOW_MODELS["video"][0]
+    )
+    resolved_imodel = (
+        image_model.strip()
+        or str(config.app.get("useapi_image_model", "") or "").strip()
+        or USEAPI_GOOGLE_FLOW_MODELS["image"][0]
+    )
+    return {
+        "useapi_api_token": resolved_token,
+        "useapi_video_model": resolved_vmodel,
+        "useapi_image_model": resolved_imodel,
+    }
+
+
+def test_gemini_connection(
+    *,
+    api_key: str = "",
+    model_name: str = "",
+) -> dict[str, Any]:
+    """Verify live Gemini connectivity, Free-Tier model discovery, and latency."""
+    runtime_cfg = resolve_gemini_runtime_config(api_key=api_key, model_name=model_name)
+    resolved_key = runtime_cfg["gemini_api_key"]
+    resolved_model = runtime_cfg["gemini_model_name"]
+    if not resolved_key:
+        return {
+            "ok": False,
+            "model_name": resolved_model,
+            "discovered_models": [],
+            "latency_ms": 0,
+            "error": "GEMINI_API_KEY belum ditetapkan.",
+        }
+
+    started = time.perf_counter()
+    discovered = discover_free_tier_gemini_models(
+        resolved_key,
+        base_url=runtime_cfg.get("gemini_base_url", ""),
+    )
+    ok, raw_text, used_model, error_bm = _execute_gemini_with_fallback(
+        "Reply with exactly: OK",
+        runtime_cfg,
+        resolved_key,
+        resolved_model,
+    )
+    latency_ms = round((time.perf_counter() - started) * 1000)
+    return {
+        "ok": ok and bool(raw_text.strip()),
+        "model_name": used_model,
+        "discovered_models": discovered,
+        "latency_ms": latency_ms,
+        "error": error_bm if not ok else "",
+    }
 
 
 def generate_visual_terms(
@@ -738,12 +1154,16 @@ def build_tiktok_video_params(
     subtitle_display_mode: SubtitleDisplayMode = "sentence",
     subtitle_animation: SubtitleAnimation = "pop_spring",
     subtitle_position: str = "bottom",
+    text_fore_color: str = "#FFFFFF",
+    video_aspect: str = "9:16",
     bgm_type: str = "random",
+    bgm_file: str = "",
     bgm_volume: float = 0.15,
     clip_duration: int = 4,
+    video_count: int = 1,
     font_name: str = DEFAULT_SUBTITLE_FONT,
 ) -> VideoParams:
-    """Build validated 9:16 TikTok/Reels VideoParams ready for task.start."""
+    """Build validated TikTok/Reels/Shorts VideoParams ready for task.start."""
     clean_subject = product_name.strip() or "Kempen Video Kilang Pemasaran"
     clean_script = script.strip()
     if not clean_script:
@@ -765,32 +1185,35 @@ def build_tiktok_video_params(
         else:
             parsed_terms = [str(t).strip() for t in (video_terms or []) if str(t).strip()]
         if not parsed_terms:
-            raise ValueError("Kata kunci visual stok diperlukan untuk Pexels/Pixabay.")
+            raise ValueError("Kata kunci visual stok/AI diperlukan untuk sumber ini.")
         terms_arg = parsed_terms
+
+    aspect_enum = VideoAspect(video_aspect)
 
     return VideoParams(
         video_subject=clean_subject,
         video_script=clean_script,
         video_terms=terms_arg,
-        video_aspect=VideoAspect.portrait,
+        video_aspect=aspect_enum,
         video_fit_mode=VideoFitMode.cover,
         image_motion=ImageMotion.zoom,
         video_concat_mode=VideoConcatMode.sequential,
         video_clip_duration=max(2, int(clip_duration)),
-        video_count=1,
+        video_count=max(1, min(int(video_count), 3)),
         video_source=source,
         video_materials=materials_arg,
         voice_name=voice_name or DEFAULT_MALAY_VOICE,
         voice_rate=float(voice_rate),
         voice_volume=1.0,
         bgm_type=bgm_type,
+        bgm_file=bgm_file or "",
         bgm_volume=float(bgm_volume),
         subtitle_enabled=bool(subtitle_enabled),
         subtitle_position=subtitle_position,
         subtitle_display_mode=subtitle_display_mode,
         subtitle_animation=subtitle_animation,
         font_name=resolve_subtitle_font(font_name),
-        text_fore_color="#FFFFFF",
+        text_fore_color=text_fore_color or "#FFFFFF",
         stroke_color="#000000",
         stroke_width=2.0,
         font_size=62,

@@ -406,6 +406,109 @@ class TestKilangStudio(unittest.TestCase):
                 video_source="unsupported_source",
             )
 
+        custom_params = ks.build_tiktok_video_params(
+            product_name="Radhi Fruits 4690",
+            script="Skrip nisbah 1:1 kuning",
+            video_source="useapi",
+            video_terms=["durian stall"],
+            video_aspect="1:1",
+            text_fore_color="#FDE047",
+            bgm_type="custom",
+            bgm_file="resource/songs/output000.mp3",
+            video_count=2,
+        )
+        self.assertEqual(custom_params.video_aspect, VideoAspect.square)
+        self.assertEqual(custom_params.text_fore_color, "#FDE047")
+        self.assertEqual(custom_params.bgm_type, "custom")
+        self.assertEqual(custom_params.video_count, 2)
+
+    def test_v2_batch_angles_flow_prompts_social_pack_useapi_and_diagnostics(self):
+        self.assertEqual(set(ks.BATCH_ANGLES.keys()), {"urgensi", "kualiti", "bukti_sosial"})
+        self.assertIn("#FDE047", ks.SUBTITLE_COLOR_PRESETS)
+        self.assertIn("9:16", ks.ASPECT_OPTIONS)
+        self.assertIn("veo-3.1-lite", ks.USEAPI_GOOGLE_FLOW_MODELS["video"])
+        self.assertIn("nano-banana-2-lite", ks.USEAPI_GOOGLE_FLOW_MODELS["image"])
+
+        radhi = ks.get_preset("radhi_fruits").to_brief()
+
+        offline_batch = ks.build_batch_offline_templates(radhi)
+        self.assertEqual(len(offline_batch), 3)
+        self.assertEqual({d.angle_key for d in offline_batch}, {"urgensi", "kualiti", "bukti_sosial"})
+        for item in offline_batch:
+            self.assertTrue(item.result.ok)
+            self.assertEqual(item.result.source, "offline_template")
+            self.assertIn("Radhi Fruits", item.result.script)
+
+        with patch(
+            "app.services.kilang_studio.llm._generate_response",
+            return_value="Jom serbu Radhi Fruits hari ini sebelum stok durian kampung habis!",
+        ):
+            ai_batch = ks.generate_batch_malay_scripts(
+                radhi,
+                angles=("urgensi", "kualiti"),
+                api_key="AIzaFakeKey",
+                model_name="gemini-3.8-flash",
+            )
+            self.assertEqual(len(ai_batch), 2)
+            self.assertTrue(all(item.result.ok and item.result.source == "gemini" for item in ai_batch))
+
+        offline_flow = ks.build_offline_flow_prompts(radhi, scene_count=3)
+        self.assertTrue(offline_flow.ok)
+        self.assertEqual(offline_flow.source, "offline_template")
+        self.assertEqual(len(offline_flow.prompts), 3)
+        self.assertTrue(all("9:16" in p for p in offline_flow.prompts))
+
+        with patch(
+            "app.services.kilang_studio.llm._generate_response",
+            return_value='```json\n["Vertical 9:16 close-up of fresh durian", "Vertical 9:16 stall pickup", "Vertical 9:16 happy buyer"]\n```',
+        ):
+            ai_flow = ks.generate_google_flow_prompts(
+                radhi,
+                "Skrip durian segar",
+                scene_count=3,
+                api_key="AIzaFakeKey",
+            )
+            self.assertTrue(ai_flow.ok)
+            self.assertEqual(ai_flow.source, "gemini")
+            self.assertEqual(len(ai_flow.prompts), 3)
+
+        offline_social = ks.build_offline_social_pack(radhi, platform="tiktok")
+        self.assertTrue(offline_social.ok)
+        self.assertEqual(offline_social.source, "offline_template")
+        self.assertTrue(len(offline_social.hashtags) >= 3)
+
+        with patch(
+            "app.services.kilang_studio.llm._generate_response",
+            return_value='{"title": "Durian Segar Kemaman", "caption": "Stok pagi ini memang padu!", "hashtags": ["#radhifruits", "#kemaman"]}',
+        ):
+            ai_social = ks.generate_social_pack(
+                radhi,
+                "Skrip durian segar",
+                api_key="AIzaFakeKey",
+            )
+            self.assertTrue(ai_social.ok)
+            self.assertEqual(ai_social.source, "gemini")
+            self.assertEqual(ai_social.title, "Durian Segar Kemaman")
+            self.assertEqual(ai_social.hashtags, ("#radhifruits", "#kemaman"))
+
+        with patch.dict(os.environ, {"USEAPI_TOKEN": "useapi-env-tok"}, clear=True):
+            ucfg = ks.resolve_useapi_config()
+            self.assertEqual(ucfg["useapi_api_token"], "useapi-env-tok")
+            self.assertEqual(ucfg["useapi_video_model"], "veo-3.1-lite")
+
+        with patch(
+            "app.services.kilang_studio.discover_free_tier_gemini_models",
+            return_value=["gemini-3.8-flash", "gemini-3.5-flash-lite"],
+        ):
+            with patch(
+                "app.services.kilang_studio.llm._generate_response",
+                return_value="OK",
+            ):
+                diag = ks.test_gemini_connection(api_key="AIzaFakeKey", model_name="gemini-3.8-flash")
+                self.assertTrue(diag["ok"])
+                self.assertEqual(diag["model_name"], "gemini-3.8-flash")
+                self.assertIn("gemini-3.5-flash-lite", diag["discovered_models"])
+
     def test_streamlit_kilang_studio_apptest_smoke(self):
         from streamlit.testing.v1 import AppTest
 
@@ -419,38 +522,138 @@ class TestKilangStudio(unittest.TestCase):
                 "GEMINI_MODEL_NAME",
                 "PEXELS_API_KEY",
                 "PIXABAY_API_KEY",
+                "USEAPI_TOKEN",
             }
         }
-        with patch.dict(os.environ, clean_env, clear=True):
-            with patch.dict(config.app, {"gemini_api_key": ""}, clear=False):
-                at = AppTest.from_file(str(app_path), default_timeout=30)
-                at.run()
-                self.assertEqual(len(at.exception), 0, f"Unexpected UI exceptions: {at.exception}")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            brands_store = Path(tmpdir) / "brands.json"
+            history_store = Path(tmpdir) / "history.json"
+            inbox_dir = Path(tmpdir) / "flow_inbox"
+            inbox_dir.mkdir()
+            from PIL import Image
 
-                # Switch preset to PedalHaus Chukai and click Load Preset
-                at.selectbox(key="selected_preset_picker").set_value("pedalhaus_chukai").run()
-                load_btn = next(b for b in at.button if b.label == "Muat Contoh Kempen")
-                load_btn.click().run()
-                self.assertEqual(len(at.exception), 0)
-                self.assertEqual(at.session_state["product_name"], "PedalHaus Chukai")
+            Image.new("RGB", (64, 64), color="green").save(inbox_dir / "valid-flow.png", format="PNG")
+            (inbox_dir / "corrupt-flow.png").write_bytes(b"not-a-valid-png")
 
-                # Click offline template button
-                tpl_btn = next(
-                    b for b in at.button if b.label == "Guna Draf Templat Tempatan (Tanpa AI)"
-                )
-                tpl_btn.click().run()
-                self.assertEqual(len(at.exception), 0)
-                self.assertIn("PedalHaus Chukai", at.session_state["video_script"])
-                self.assertEqual(
-                    at.session_state["script_source_badge"],
-                    "Mod Templat Tempatan (Bukan AI)",
-                )
+            from app.services import useapi
 
-                # Click Gemini button without key -> honest error shown, no fake script overwrite
-                ai_btn = next(b for b in at.button if b.label == "Jana Skrip BM dengan Gemini")
-                ai_btn.click().run()
-                self.assertEqual(len(at.exception), 0)
-                self.assertGreaterEqual(len(at.error), 1)
+            for vid_model in ks.USEAPI_GOOGLE_FLOW_MODELS["video"]:
+                self.assertIn(vid_model, useapi.MODELS)
+            for img_model in ks.USEAPI_GOOGLE_FLOW_MODELS["image"]:
+                self.assertIn(img_model, useapi.IMAGE_MODELS)
+
+            with patch.dict(os.environ, clean_env, clear=True):
+                with patch.dict(config.app, {"gemini_api_key": ""}, clear=False):
+                    with patch(
+                        "app.services.kilang_vault._default_brands_path",
+                        return_value=brands_store,
+                    ):
+                        with patch(
+                            "app.services.kilang_vault._default_history_path",
+                            return_value=history_store,
+                        ):
+                            with patch(
+                                "app.services.studio_browser.flow_inbox_dir",
+                                return_value=inbox_dir,
+                            ):
+                                at = AppTest.from_file(str(app_path), default_timeout=30)
+                                at.run()
+                                self.assertEqual(
+                                    len(at.exception),
+                                    0,
+                                    f"Unexpected UI exceptions: {at.exception}",
+                                )
+
+                                # Switch brand to PedalHaus Chukai and click Muat Profil Jenama
+                                at.selectbox(key="selected_brand_picker").set_value(
+                                    "pedalhaus_chukai"
+                                ).run()
+                                load_btn = next(
+                                    b for b in at.button if b.label == "Muat Profil Jenama"
+                                )
+                                load_btn.click().run()
+                                self.assertEqual(len(at.exception), 0)
+                                self.assertEqual(
+                                    at.session_state["product_name"], "PedalHaus Chukai"
+                                )
+
+                                # Click offline template button
+                                tpl_btn = next(
+                                    b
+                                    for b in at.button
+                                    if b.label == "Guna Draf Templat Tempatan (Tanpa AI)"
+                                )
+                                tpl_btn.click().run()
+                                self.assertEqual(len(at.exception), 0)
+                                self.assertIn(
+                                    "PedalHaus Chukai", at.session_state["video_script"]
+                                )
+                                self.assertEqual(
+                                    at.session_state["script_source_badge"],
+                                    "Mod Templat Tempatan (Bukan AI)",
+                                )
+
+                                # Click Gemini button without key -> honest error shown
+                                ai_btn = next(
+                                    b
+                                    for b in at.button
+                                    if b.label == "Jana Skrip BM dengan Gemini"
+                                )
+                                ai_btn.click().run()
+                                self.assertEqual(len(at.exception), 0)
+                                self.assertGreaterEqual(len(at.error), 1)
+
+                                # Click offline Google Flow prompt generator in Tab 2
+                                flow_tpl_btn = next(
+                                    b
+                                    for b in at.button
+                                    if b.label == "Guna Templat Prompt Flow"
+                                )
+                                flow_tpl_btn.click().run()
+                                self.assertEqual(len(at.exception), 0)
+                                self.assertEqual(
+                                    len(at.session_state["flow_prompts_list"]), 4
+                                )
+
+                                # Click Tab 2 cross-tab Flow Inbox button without crashing
+                                use_inbox_btn = next(
+                                    b
+                                    for b in at.button
+                                    if b.key == "use_all_flow_inbox_btn"
+                                )
+                                use_inbox_btn.click().run()
+                                self.assertEqual(
+                                    len(at.exception),
+                                    0,
+                                    f"Tab 2 cross-tab crash: {at.exception}",
+                                )
+                                self.assertEqual(
+                                    at.session_state["media_mode"], "flow_inbox"
+                                )
+                                self.assertIn(
+                                    "valid-flow.png",
+                                    at.session_state["selected_flow_inbox_files"],
+                                )
+
+                                # Click Tab 3 cross-tab Brand Vault load button without crashing
+                                vault_btn = next(
+                                    b
+                                    for b in at.button
+                                    if b.key == "vault_load_radhi_fruits"
+                                )
+                                vault_btn.click().run()
+                                self.assertEqual(
+                                    len(at.exception),
+                                    0,
+                                    f"Tab 3 cross-tab crash: {at.exception}",
+                                )
+                                self.assertEqual(
+                                    at.session_state["product_name"], "Radhi Fruits 4690"
+                                )
+                                self.assertEqual(
+                                    at.session_state["selected_brand_picker"],
+                                    "radhi_fruits",
+                                )
 
 
 if __name__ == "__main__":
