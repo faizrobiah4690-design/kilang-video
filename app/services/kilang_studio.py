@@ -27,21 +27,37 @@ from app.utils import file_security, utils
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 GEMINI_MODEL_OPTIONS: tuple[str, ...] = (
     "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite",
     "gemini-3.1-pro-preview",
-    "gemini-2.5-flash",
 )
 GEMINI_FALLBACK_MODELS: tuple[str, ...] = (
     "gemini-3.8-flash",
-    "gemini-3.1-pro-preview",
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite",
 )
+MAX_GEMINI_FALLBACK_MODELS = 3
 GEMINI_RETRY_DELAY_SECONDS = 1.5
-_TRANSIENT_ERROR_MARKERS = (
-    "503",
-    "unavailable",
-    "high demand",
-    "overloaded",
-    "429",
-    "resource_exhausted",
+_OVERLOAD_ERROR_MARKERS = ("503", "unavailable", "high demand", "overloaded")
+_QUOTA_OR_MISSING_MARKERS = ("429", "resource_exhausted", "limit: 0", "404", "not_found")
+_AUTH_ERROR_MARKERS = ("400", "401", "403", "api_key_invalid", "invalid api key")
+_EXCLUDED_FREE_MODEL_TOKENS = (
+    "pro",
+    "embedding",
+    "imagen",
+    "veo",
+    "tts",
+    "audio",
+    "live",
+    "image",
+    "robotics",
+    "computer-use",
+    "deep-research",
+    "vision",
+    "learnlm",
+    "1.0",
+    "1.5",
+    "2.0",
 )
 
 MALAY_VOICES: dict[str, str] = {
@@ -363,14 +379,71 @@ def _clean_generated_script(text: str) -> str:
     return "\n\n".join(paragraphs).strip()
 
 
-def _is_transient_gemini_error(detail: str) -> bool:
+def _is_overload_error(detail: str) -> bool:
     lowered = str(detail or "").lower()
-    return any(marker in lowered for marker in _TRANSIENT_ERROR_MARKERS)
+    return any(marker in lowered for marker in _OVERLOAD_ERROR_MARKERS)
+
+
+def _is_quota_or_missing_model_error(detail: str) -> bool:
+    lowered = str(detail or "").lower()
+    return any(marker in lowered for marker in _QUOTA_OR_MISSING_MARKERS)
+
+
+def _is_auth_or_request_error(detail: str) -> bool:
+    lowered = str(detail or "").lower()
+    return any(marker in lowered for marker in _AUTH_ERROR_MARKERS)
+
+
+def _free_tier_model_sort_key(model_id: str) -> tuple[int, tuple[int, ...], str]:
+    lowered = model_id.lower()
+    if "flash-lite" in lowered:
+        tier = 0
+    elif "flash" in lowered:
+        tier = 1
+    else:
+        tier = 2
+    version_nums = tuple(-int(part) for part in re.findall(r"\d+", lowered))
+    return (tier, version_nums, lowered)
+
+
+def discover_free_tier_gemini_models(api_key: str, base_url: str = "") -> list[str]:
+    """List and rank active Free-Tier-eligible Flash-Lite / Flash / Gemma-3 text models."""
+    if not api_key:
+        return []
+    try:
+        from google import genai
+        from google.genai import types
+
+        http_options = types.HttpOptions(base_url=base_url) if base_url else None
+        candidates: list[str] = []
+        with genai.Client(api_key=api_key, http_options=http_options) as client:
+            for model in client.models.list():
+                actions = getattr(model, "supported_actions", None) or []
+                if actions and "generateContent" not in actions:
+                    continue
+                name = str(getattr(model, "name", "") or "").removeprefix("models/").strip()
+                lowered = name.lower()
+                if not (lowered.startswith("gemini-") or lowered.startswith("gemma-3")):
+                    continue
+                if any(token in lowered for token in _EXCLUDED_FREE_MODEL_TOKENS):
+                    continue
+                if name not in candidates:
+                    candidates.append(name)
+        candidates.sort(key=_free_tier_model_sort_key)
+        return candidates
+    except Exception:
+        return []
 
 
 def _format_gemini_error_bm(model_name: str, detail: str) -> str:
     lowered = str(detail or "").lower()
-    if any(k in lowered for k in ("503", "unavailable", "high demand", "overloaded")):
+    if "limit: 0" in lowered:
+        return (
+            f"Model {model_name} tiada kuota pada pelan percuma Google AI Studio (limit: 0). "
+            "Sila pilih model Flash / Flash-Lite di panel kiri seperti gemini-3.8-flash atau "
+            "gemini-3.5-flash-lite."
+        )
+    if _is_overload_error(lowered):
         return (
             f"Pelayan Google Gemini ({model_name}) sedang sesak buat sementara waktu "
             "(503 UNAVAILABLE). Sila cuba klik semula beberapa saat lagi, tukar model di panel "
@@ -397,6 +470,41 @@ def _run_gemini_once(prompt: str, runtime_cfg: dict[str, Any], resolved_key: str
     if raw_text.startswith("Error:"):
         return "", _redact_secret(raw_text.removeprefix("Error:").strip(), resolved_key)
     return raw_text, ""
+
+
+def _build_free_tier_fallbacks(
+    primary_model: str,
+    api_key: str,
+    base_url: str,
+) -> list[str]:
+    ordered: list[str] = []
+    for candidate in (
+        *discover_free_tier_gemini_models(api_key, base_url=base_url),
+        *GEMINI_FALLBACK_MODELS,
+    ):
+        if candidate != primary_model and candidate not in ordered:
+            ordered.append(candidate)
+        if len(ordered) >= MAX_GEMINI_FALLBACK_MODELS:
+            break
+    return ordered
+
+
+def _finalize_gemini_result(model_name: str, raw_text: str) -> ScriptGenerationResult:
+    cleaned = _clean_generated_script(raw_text)
+    if not cleaned:
+        return ScriptGenerationResult(
+            ok=False,
+            script="",
+            source="error",
+            model_name=model_name,
+            error=f"Gemini ({model_name}) tidak memulangkan teks narasi yang sah.",
+        )
+    return ScriptGenerationResult(
+        ok=True,
+        script=cleaned,
+        source="gemini",
+        model_name=model_name,
+    )
 
 
 def generate_malay_script(
@@ -440,54 +548,58 @@ def generate_malay_script(
         custom_system_prompt=MALAY_MARKETING_SYSTEM_PROMPT,
     )
 
-    attempt_models = [
-        resolved_model,
-        resolved_model,
-        *[m for m in GEMINI_FALLBACK_MODELS if m != resolved_model],
-    ]
-    last_model = resolved_model
-    last_error = ""
+    raw_text, error_detail = _run_gemini_once(prompt, runtime_cfg, resolved_key)
+    if not error_detail:
+        return _finalize_gemini_result(resolved_model, raw_text)
 
-    for idx, candidate_model in enumerate(attempt_models):
-        attempt_cfg = {**runtime_cfg, "gemini_model_name": candidate_model}
-        raw_text, error_detail = _run_gemini_once(prompt, attempt_cfg, resolved_key)
-        last_model = candidate_model
-        if error_detail:
-            last_error = error_detail
-            if _is_transient_gemini_error(error_detail) and idx < len(attempt_models) - 1:
-                time.sleep(GEMINI_RETRY_DELAY_SECONDS)
-                continue
-            return ScriptGenerationResult(
-                ok=False,
-                script="",
-                source="error",
-                model_name=last_model,
-                error=_format_gemini_error_bm(last_model, error_detail),
-            )
-
-        cleaned = _clean_generated_script(raw_text)
-        if not cleaned:
-            return ScriptGenerationResult(
-                ok=False,
-                script="",
-                source="error",
-                model_name=last_model,
-                error=f"Gemini ({last_model}) tidak memulangkan teks narasi yang sah.",
-            )
-
+    if _is_auth_or_request_error(error_detail):
         return ScriptGenerationResult(
-            ok=True,
-            script=cleaned,
-            source="gemini",
-            model_name=last_model,
+            ok=False,
+            script="",
+            source="error",
+            model_name=resolved_model,
+            error=_format_gemini_error_bm(resolved_model, error_detail),
         )
+
+    attempt_queue: list[str] = []
+    if _is_overload_error(error_detail):
+        attempt_queue.append(resolved_model)
+    elif not _is_quota_or_missing_model_error(error_detail):
+        return ScriptGenerationResult(
+            ok=False,
+            script="",
+            source="error",
+            model_name=resolved_model,
+            error=_format_gemini_error_bm(resolved_model, error_detail),
+        )
+
+    attempt_queue.extend(
+        _build_free_tier_fallbacks(
+            resolved_model,
+            resolved_key,
+            runtime_cfg.get("gemini_base_url", ""),
+        )
+    )
+
+    last_model = resolved_model
+    last_error = error_detail
+    for candidate_model in attempt_queue:
+        time.sleep(GEMINI_RETRY_DELAY_SECONDS)
+        attempt_cfg = {**runtime_cfg, "gemini_model_name": candidate_model}
+        cand_text, cand_err = _run_gemini_once(prompt, attempt_cfg, resolved_key)
+        last_model = candidate_model
+        if not cand_err:
+            return _finalize_gemini_result(candidate_model, cand_text)
+        last_error = cand_err
+        if _is_auth_or_request_error(cand_err):
+            break
 
     return ScriptGenerationResult(
         ok=False,
         script="",
         source="error",
         model_name=last_model,
-        error=_format_gemini_error_bm(last_model, last_error or "tiada respons"),
+        error=_format_gemini_error_bm(last_model, last_error),
     )
 
 
