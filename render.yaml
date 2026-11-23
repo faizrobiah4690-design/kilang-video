@@ -5,12 +5,12 @@ services:
     plan: free
     dockerfilePath: ./Dockerfile.kilang
     healthCheckPath: /_stcore/health
-    autoDeploy: false
+    autoDeploy: true
     envVars:
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL_NAME
-        value: gemini-2.5-flash
+        value: gemini-3.8-flash
       - key: PEXELS_API_KEY
         sync: false
       - key: PIXABAY_API_KEY

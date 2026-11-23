@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import re
 import shutil
 from typing import Any, Iterable, Literal
 
@@ -22,11 +23,11 @@ from app.models.schema import (
 from app.services import llm, material_upload
 from app.utils import file_security, utils
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 GEMINI_MODEL_OPTIONS: tuple[str, ...] = (
+    "gemini-3.8-flash",
+    "gemini-3.1-pro-preview",
     "gemini-2.5-flash",
-    "gemini-2.5-pro",
-    "gemini-2.0-flash",
 )
 
 MALAY_VOICES: dict[str, str] = {
@@ -329,6 +330,25 @@ def build_malay_brief_requirements(brief: CampaignBrief) -> str:
     return "\n".join(lines)
 
 
+def _clean_generated_script(text: str) -> str:
+    """Strip markdown artifacts and stage directions while keeping spoken narration clean."""
+    cleaned = llm._strip_code_fence(str(text or "")).replace("*", "")
+    cleaned = re.sub(
+        r"(?m)^[ \t]{0,3}#{1,6}[ \t]+(.*?)[ \t]*$",
+        lambda match: re.sub(r"[ \t]+#+[ \t]*$", "", match.group(1)),
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"\[([^\]\n]+)\]\((?:[^()\n]|\([^()\n]*\))*\)",
+        lambda match: match.group(1),
+        cleaned,
+    )
+    cleaned = re.sub(r"\[.*?\]", "", cleaned)
+    cleaned = re.sub(r"\(.*?\)", "", cleaned)
+    paragraphs = [p.strip() for p in cleaned.split("\n\n") if p.strip()]
+    return "\n\n".join(paragraphs).strip()
+
+
 def generate_malay_script(
     brief: CampaignBrief,
     *,
@@ -362,42 +382,52 @@ def generate_malay_script(
 
     profile = _duration_profile(brief.duration_seconds)
     requirements = build_malay_brief_requirements(brief)
+    prompt = llm.build_script_prompt(
+        video_subject=product_name,
+        language="Bahasa Melayu (Malaysia)",
+        paragraph_number=profile["paragraphs"],
+        video_script_prompt=requirements,
+        custom_system_prompt=MALAY_MARKETING_SYSTEM_PROMPT,
+    )
 
     try:
-        raw_response = llm.generate_script(
-            video_subject=product_name,
-            language="Bahasa Melayu (Malaysia)",
-            paragraph_number=profile["paragraphs"],
-            video_script_prompt=requirements,
-            custom_system_prompt=MALAY_MARKETING_SYSTEM_PROMPT,
-            app_config=runtime_cfg,
-        )
+        raw_response = llm._generate_response(prompt=prompt, app_config=runtime_cfg)
     except Exception as exc:
         return ScriptGenerationResult(
             ok=False,
             script="",
             source="error",
             model_name=resolved_model,
-            error=f"Gagal menghubungi Gemini: {_redact_secret(str(exc), resolved_key)}",
+            error=f"Gagal menghubungi Gemini ({resolved_model}): {_redact_secret(str(exc), resolved_key)}",
         )
 
-    cleaned = str(raw_response or "").strip()
+    raw_text = str(raw_response or "").strip()
+    if not raw_text:
+        return ScriptGenerationResult(
+            ok=False,
+            script="",
+            source="error",
+            model_name=resolved_model,
+            error=f"Gemini ({resolved_model}) memulangkan respons kosong. Sila cuba jana semula.",
+        )
+    if raw_text.startswith("Error:"):
+        detail = _redact_secret(raw_text.removeprefix("Error:").strip(), resolved_key)
+        return ScriptGenerationResult(
+            ok=False,
+            script="",
+            source="error",
+            model_name=resolved_model,
+            error=f"Ralat Gemini ({resolved_model}): {detail}",
+        )
+
+    cleaned = _clean_generated_script(raw_text)
     if not cleaned:
         return ScriptGenerationResult(
             ok=False,
             script="",
             source="error",
             model_name=resolved_model,
-            error="Gemini memulangkan skrip kosong. Sila cuba jana semula.",
-        )
-    if cleaned.startswith("Error:"):
-        detail = _redact_secret(cleaned.removeprefix("Error:").strip(), resolved_key)
-        return ScriptGenerationResult(
-            ok=False,
-            script="",
-            source="error",
-            model_name=resolved_model,
-            error=f"Ralat Gemini: {detail}",
+            error=f"Gemini ({resolved_model}) tidak memulangkan teks narasi yang sah.",
         )
 
     return ScriptGenerationResult(

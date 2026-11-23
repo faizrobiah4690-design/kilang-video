@@ -43,7 +43,7 @@ class _FakeUpload:
 
 class TestKilangStudio(unittest.TestCase):
     def test_constants_and_presets(self):
-        self.assertEqual(ks.DEFAULT_GEMINI_MODEL, "gemini-2.5-flash")
+        self.assertEqual(ks.DEFAULT_GEMINI_MODEL, "gemini-3.8-flash")
         self.assertEqual(ks.DEFAULT_MALAY_VOICE, "ms-MY-YasminNeural-Female")
         self.assertEqual(ks.DEFAULT_SUBTITLE_FONT, "BeVietnamPro-Bold.ttf")
 
@@ -155,7 +155,7 @@ class TestKilangStudio(unittest.TestCase):
         radhi = ks.get_preset("radhi_fruits").to_brief()
         with patch.dict(os.environ, {}, clear=True):
             with patch.dict(config.app, {"gemini_api_key": ""}, clear=False):
-                with patch("app.services.kilang_studio.llm.generate_script") as mock_gen:
+                with patch("app.services.kilang_studio.llm._generate_response") as mock_gen:
                     res_no_key = ks.generate_malay_script(radhi)
                     self.assertFalse(res_no_key.ok)
                     self.assertEqual(res_no_key.source, "error")
@@ -165,29 +165,33 @@ class TestKilangStudio(unittest.TestCase):
     def test_generate_malay_script_calls_gemini_and_redacts_errors(self):
         radhi = ks.get_preset("radhi_fruits").to_brief()
         with patch(
-            "app.services.kilang_studio.llm.generate_script",
-            return_value="Orang Kemaman, stok durian kampung baru turun pagi ini!",
+            "app.services.kilang_studio.llm._generate_response",
+            return_value="**[Hook]** Orang Kemaman, stok durian kampung baru turun pagi ini! (BGM ceria)",
         ) as mock_gen:
             result = ks.generate_malay_script(
                 radhi,
                 api_key="AIzaSySecretKey123",
-                model_name="gemini-2.5-flash",
+                model_name="gemini-3.8-flash",
             )
             self.assertTrue(result.ok)
             self.assertEqual(result.source, "gemini")
-            self.assertEqual(result.model_name, "gemini-2.5-flash")
-            self.assertIn("durian kampung", result.script.lower())
+            self.assertEqual(result.model_name, "gemini-3.8-flash")
+            self.assertEqual(
+                result.script,
+                "Orang Kemaman, stok durian kampung baru turun pagi ini!",
+            )
 
             kwargs = mock_gen.call_args.kwargs
-            self.assertEqual(kwargs["language"], "Bahasa Melayu (Malaysia)")
-            self.assertEqual(kwargs["custom_system_prompt"], ks.MALAY_MARKETING_SYSTEM_PROMPT)
+            self.assertIn(ks.MALAY_MARKETING_SYSTEM_PROMPT, kwargs["prompt"])
+            self.assertIn("Bahasa Melayu (Malaysia)", kwargs["prompt"])
+            self.assertIn("Radhi Fruits", kwargs["prompt"])
             self.assertEqual(kwargs["app_config"]["llm_provider"], "gemini")
             self.assertEqual(kwargs["app_config"]["gemini_api_key"], "AIzaSySecretKey123")
-            self.assertIn("Radhi Fruits", kwargs["video_script_prompt"])
+            self.assertEqual(kwargs["app_config"]["gemini_model_name"], "gemini-3.8-flash")
 
         with patch(
-            "app.services.kilang_studio.llm.generate_script",
-            return_value="Error: Invalid key AIzaSySecretKey123",
+            "app.services.kilang_studio.llm._generate_response",
+            return_value="Error: 404 NOT_FOUND for key AIzaSySecretKey123",
         ):
             err_result = ks.generate_malay_script(
                 radhi,
@@ -195,6 +199,7 @@ class TestKilangStudio(unittest.TestCase):
             )
             self.assertFalse(err_result.ok)
             self.assertEqual(err_result.source, "error")
+            self.assertIn("404 NOT_FOUND", err_result.error)
             self.assertNotIn("AIzaSySecretKey123", err_result.error)
 
     def test_generate_visual_terms_and_missing_key(self):
