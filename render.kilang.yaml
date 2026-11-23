@@ -2,6 +2,7 @@ services:
   - type: web
     name: kilang-pemasaran-video
     runtime: docker
+    plan: free
     dockerfilePath: ./Dockerfile.kilang
     healthCheckPath: /_stcore/health
     autoDeploy: false
